@@ -7,3 +7,5 @@ __pycache__/
 .env.*
 .streamlit/secrets.toml
 *.zip
+.cache/
+.pytest_cache/

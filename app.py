@@ -1,9 +1,7 @@
-from html import escape, unescape
-import json
+from html import escape
 import math
 import os
 from pathlib import Path
-import re
 import time
 
 import folium
@@ -12,11 +10,11 @@ import requests
 import streamlit as st
 
 from ev_logic import DESTINATION, ORIGIN, calculate_recommendations
+from local_cache import LocalCache
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_PATH = BASE_DIR / "california_fast_chargers.csv"
-SNAPSHOT_PATH = BASE_DIR / "notebook_snapshot.json"
-SAVED_MAP_PATH = BASE_DIR / "ev_route_map_saved.html"
+DISK_CACHE = LocalCache(BASE_DIR / ".cache/lookup_cache.sqlite3")
 NOMINATIM_URL = os.environ.get(
     "EV_GEOCODER_URL", "https://nominatim.openstreetmap.org/search"
 )
@@ -24,6 +22,8 @@ DEFAULT_INPUTS = {
     "origin_name": "San Jose, CA", "destination_name": "Lake Tahoe, CA",
     "battery_percent": 45, "full_range_miles": 300,
     "safety_reserve_pct": 20, "vehicle_connector": "NACS",
+    "charge_target_pct": 80, "battery_capacity_kwh": 75,
+    "electricity_price_per_kwh": .45,
 }
 
 
@@ -37,6 +37,9 @@ def geocode_place(place):
     }
     if normalized in known:
         return known[normalized]
+    cached = DISK_CACHE.get("geocoder-v1", [NOMINATIM_URL, normalized], 7 * 86400)
+    if cached is not None:
+        return tuple(cached[0]), cached[1]
     if not normalized:
         raise ValueError("Origin and Destination cannot be empty.")
     try:
@@ -55,7 +58,9 @@ def geocode_place(place):
         if not (math.isfinite(point[0]) and math.isfinite(point[1])
                 and -90 <= point[0] <= 90 and -180 <= point[1] <= 180):
             raise ValueError(f"Invalid coordinates for: {place}")
-        return point, str(results[0].get("display_name", place))
+        result = (point, str(results[0].get("display_name", place)))
+        DISK_CACHE.put("geocoder-v1", [NOMINATIM_URL, normalized], result)
+        return result
     except (requests.RequestException, KeyError, TypeError, ValueError) as exc:
         raise ValueError(f"Could not locate {place}: {exc}") from exc
     finally:
@@ -72,6 +77,14 @@ def load_data(path, modified_ns):
 @st.cache_data(ttl=3600, max_entries=512, show_spinner=False)
 def fetch_route(start, end, geometry=False):
     """OSRM road distance, including the drive to/from the charger itself."""
+    key = [list(start), list(end)]
+    kind = "osrm-geometry-v1" if geometry else "osrm-distance-v1"
+    cached = DISK_CACHE.get(kind, key, 86400)
+    if cached is not None:
+        return cached
+    unavailable = DISK_CACHE.get("osrm-unavailable-v1", key, 120)
+    if unavailable is not None:
+        raise ValueError(unavailable)
     url = (
         "https://router.project-osrm.org/route/v1/driving/"
         f"{start[1]},{start[0]};{end[1]},{end[0]}"
@@ -103,25 +116,91 @@ def fetch_route(start, end, geometry=False):
             ):
                 raise ValueError("OSRM returned invalid route geometry.")
             result["route_points"] = points
+        DISK_CACHE.put(kind, key, result)
+        if geometry:
+            DISK_CACHE.put("osrm-distance-v1", key, {
+                "distance_miles": result["distance_miles"],
+                "duration_hours": result["duration_hours"],
+            })
         return result
     except (requests.RequestException, KeyError, TypeError, ValueError) as exc:
-        raise ValueError(f"Driving-route lookup failed: {exc}") from exc
+        message = f"Driving-route lookup failed: {exc}"
+        DISK_CACHE.put("osrm-unavailable-v1", key, message)
+        raise ValueError(message) from exc
     finally:
         # Runs only on cache misses; pace requests to the public demo service.
         time.sleep(1.0)
 
 
+def fetch_routes_many(start, ends):
+    """Fetch one-to-many actual road distances; no straight-line fallback."""
+    values = [DISK_CACHE.get("osrm-distance-v1", [list(start), list(end)], 86400)
+              for end in ends]
+    missing = [index for index, value in enumerate(values)
+               if value is None and DISK_CACHE.get("osrm-unavailable-v1",
+                   [list(start), list(ends[index])], 120) is None]
+    for offset in range(0, len(missing), 80):
+        indexes = missing[offset:offset + 80]
+        coords = [start] + [ends[index] for index in indexes]
+        locations = ";".join(f"{lon},{lat}" for lat, lon in coords)
+        try:
+            response = requests.get(
+                "https://router.project-osrm.org/table/v1/driving/" + locations,
+                params={"sources": "0", "destinations": ";".join(
+                    str(i) for i in range(1, len(coords))),
+                    "annotations": "distance,duration", "skip_waypoints": "true"},
+                headers={"User-Agent": "MSBA286-EV-Charging-Project"},
+                timeout=(5, 30),
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if payload.get("code") != "Ok" or payload.get("fallback_speed_cells"):
+                raise ValueError("Batch routing did not return verified road distances.")
+            distances, durations = payload["distances"][0], payload["durations"][0]
+            if len(distances) != len(indexes) or len(durations) != len(indexes):
+                raise ValueError("Incomplete batch road-distance response.")
+            checked = []
+            for distance, duration in zip(distances, durations):
+                if distance is None or duration is None:
+                    checked.append(None)
+                    continue
+                distance, duration = float(distance), float(duration)
+                if not all(math.isfinite(v) and v >= 0 for v in (distance, duration)):
+                    raise ValueError("Invalid batch road-distance response.")
+                checked.append({"distance_miles": distance / 1609.344,
+                                "duration_hours": duration / 3600})
+            for index, value in zip(indexes, checked):
+                values[index] = value
+                if value is not None:
+                    DISK_CACHE.put("osrm-distance-v1",
+                                   [list(start), list(ends[index])], value)
+                else:
+                    DISK_CACHE.put("osrm-unavailable-v1",
+                                   [list(start), list(ends[index])],
+                                   "Driving-route lookup failed: no verified road route returned.")
+        finally:
+            time.sleep(1.0)
+    return values
+
+
 @st.cache_data(ttl=900, max_entries=128, show_spinner=False)
 def fetch_amenities(lat, lon):
     """The notebook's 500 m query; preserve Type for its quality formula."""
-    query = f'''[out:json][timeout:12];(
+    key = [lat, lon]
+    cached = DISK_CACHE.get("amenities-500m-v1", key, 86400)
+    if cached is not None:
+        return cached[0], "Cached OpenStreetMap (last 24 hours)"
+    unavailable = DISK_CACHE.get("amenities-error-v1", key, 120)
+    if unavailable is not None:
+        return [], unavailable
+    query = f'''[out:json][timeout:5];(
       nwr(around:500,{lat},{lon})["amenity"~"toilets|restaurant|cafe|fast_food"];
       nwr(around:500,{lat},{lon})["shop"~"supermarket|convenience|department_store|mall"];
     );out center tags;'''
     try:
         response = requests.get(
             "https://overpass-api.de/api/interpreter",
-            params={"data": query}, timeout=(5, 15),
+            params={"data": query}, timeout=(3, 8),
             headers={"User-Agent": "MSBA286-EV-Charging-Project"},
         )
         response.raise_for_status()
@@ -137,13 +216,17 @@ def fetch_amenities(lat, lon):
                 name = "Public Restroom"
             if not name:
                 continue
-            key = (name.lower(), kind)
-            if key not in seen:
-                seen.add(key)
+            amenity_key = (name.lower(), kind)
+            if amenity_key not in seen:
+                seen.add(amenity_key)
                 amenities.append({"Name": name, "Type": kind})
-        return amenities, "Live OpenStreetMap" if amenities else "No amenities returned"
+        source = "Live OpenStreetMap" if amenities else "No amenities returned"
+        DISK_CACHE.put("amenities-500m-v1", key, [amenities, source])
+        return amenities, source
     except (requests.RequestException, KeyError, TypeError, ValueError) as exc:
-        return [], f"Amenity lookup unavailable: {exc}"
+        source = f"Amenity lookup unavailable: {exc}"
+        DISK_CACHE.put("amenities-error-v1", key, source)
+        return [], source
 
 
 def formatted(value, digits=1, suffix=""):
@@ -157,6 +240,12 @@ def reach_label(value):
 def popup_html(row, rank, destination_name):
     # Treat names from the dataset and API as text, never as executable HTML.
     label = lambda value: escape(str(value))
+    direct = row['CanReachDestination']
+    destination_battery = (
+        f"<b>Battery at Destination:</b> {formatted(row['EstimatedBatteryAtDestinationPct'], 1, '%')}<br>"
+        if pd.notna(direct) and bool(direct)
+        else "<b>Trip continuation:</b> Further charging needed before destination<br>"
+    )
     return f"""
     <div style="font:14px/1.4 Arial;min-width:260px;max-width:390px">
     <b>Recommendation #{rank}</b><br><br>
@@ -166,12 +255,13 @@ def popup_html(row, rank, destination_name):
     <b>Power:</b> {formatted(row['MaxPowerKW'], 0, ' kW')}<br>
     <b>Recorded Fast Charger Count:</b> {formatted(row['FastChargeCount'], 0)}<br><br>
     <b>Battery at Charger:</b> {formatted(row['EstimatedBatteryAtArrivalPct'], 1, '%')}<br>
-    <b>Charge Target:</b> 80%<br>
+    <b>Charge Target:</b> {formatted(row['ChargeTargetPct'], 0, '%')}<br>
     <b>Estimated Charge Time:</b> {formatted(row['RealisticChargeTimeMin'], 1, ' min')}<br><br>
+    <b>Estimated Charging Cost:</b> ${formatted(row['EstimatedChargingCost'], 2)}<br>
     <b>Distance from Route:</b> {formatted(row['DistanceToActualRouteMiles'], 2, ' miles')}<br>
     <b>Distance to {label(destination_name)}:</b> {formatted(row['DistanceToDestinationMiles'], 1, ' miles')}<br>
-    <b>Estimated Battery at Destination:</b> {formatted(row['EstimatedBatteryAtDestinationPct'], 1, '%')}<br>
-    <b>Can Reach Destination:</b> {reach_label(row['CanReachDestination'])}<br><br>
+    {destination_battery}
+    <b>Next Step:</b> {label(row['NextLegStatus'])}<br><br>
     <b>Nearby Amenities:</b> {label(row['PopupAmenities'])}<br><br>
     <b>Recommendation Score:</b> {formatted(row['RecommendationScore'])}
     </div>"""
@@ -200,60 +290,16 @@ def build_map(frame, route_points, origin_coords, destination_coords,
     return route_map.get_root().render()
 
 
-def load_saved_results():
-    """Read the notebook's historical popup values without recomputing them."""
-    original_map = BASE_DIR / "ev_route_map.html"
-    map_path = original_map if original_map.exists() else SAVED_MAP_PATH
-    html = map_path.read_text(encoding="utf-8")
-    if SNAPSHOT_PATH.exists() and map_path == SAVED_MAP_PATH:
-        rows = json.loads(SNAPSHOT_PATH.read_text(encoding="utf-8"))["recommendations"]
-        return pd.DataFrame(rows), html
-    labels = {
-        "Station": "AddressTitle", "Town": "Town", "Operator": "Operator",
-        "Power": "MaxPowerKW", "Recorded Fast Charger Count": "FastChargeCount",
-        "Battery at Charger": "EstimatedBatteryAtArrivalPct",
-        "Estimated Charge Time": "RealisticChargeTimeMin",
-        "Distance from Route": "DistanceToActualRouteMiles",
-        "Distance to Lake Tahoe": "DistanceToDestinationMiles",
-        "Estimated Battery at Destination": "EstimatedBatteryAtDestinationPct",
-        "Can Reach Destination": "CanReachDestination",
-        "Nearby Amenities": "PopupAmenities", "Recommendation Score": "RecommendationScore",
-    }
-    numbers = {
-        "MaxPowerKW", "FastChargeCount", "EstimatedBatteryAtArrivalPct",
-        "RealisticChargeTimeMin", "DistanceToActualRouteMiles",
-        "DistanceToDestinationMiles", "EstimatedBatteryAtDestinationPct",
-        "RecommendationScore",
-    }
-    records = []
-    for rank, popup in re.findall(r"<b>Recommendation #(\d+)</b>(.*?)</div>", html, re.S):
-        fields = {
-            key: unescape(re.sub(r"<[^>]+>", "", value)).strip()
-            for key, value in re.findall(
-                r"<b>([^<]+):</b>\s*(.*?)(?=<br>|$)", popup, re.S
-            )
-        }
-        record = {"Rank": int(rank), "AmenitySource": "Saved notebook map"}
-        for label, key in labels.items():
-            value = fields[label]
-            if key in numbers:
-                record[key] = float(re.match(r"[-+]?\d+(?:\.\d+)?", value).group())
-            elif key == "CanReachDestination":
-                record[key] = value == "YES"
-            else:
-                record[key] = value
-        records.append(record)
-    if not records:
-        raise ValueError("No recommendations found in ev_route_map.html")
-    return pd.DataFrame(records).sort_values("Rank"), html
 
 
-def show_results(frame, map_html, inputs, saved=False, diagnostics=None, route=None,
+def show_results(frame, map_html, inputs, diagnostics=None, route=None,
                  resolved_locations=None):
+    if not frame.empty and (pd.to_numeric(frame["EstimatedBatteryAtArrivalPct"], errors="coerce").isna().any()
+                            or (frame["EstimatedBatteryAtArrivalPct"] < inputs["safety_reserve_pct"]).any()):
+        st.warning("These results no longer meet your arrival reserve. Calculate the trip again.")
+        return
     st.subheader("Trip Summary")
-    safe_range = inputs["battery_percent"] / 100 * inputs["full_range_miles"] * (
-        1 - inputs["safety_reserve_pct"] / 100
-    )
+    safe_range = max(0, inputs["battery_percent"] - inputs["safety_reserve_pct"]) / 100 * inputs["full_range_miles"]
     st.write(f"**{inputs['origin_name']} → {inputs['destination_name']}**")
     if resolved_locations:
         st.caption("Resolved locations: " + " → ".join(resolved_locations))
@@ -266,9 +312,9 @@ def show_results(frame, map_html, inputs, saved=False, diagnostics=None, route=N
     window_max = (diagnostics or {}).get("max_stop_distance_miles", safe_range)
     st.caption(
         f"Charging window: {window_min:.1f}–{window_max:.1f} miles. "
-        "Notebook assumptions: at least 10% battery on arrival; 75 kWh battery; "
-        "charge to 80%; effective charging power = 65% of rated power. "
-        "Safety reserve is a fraction of the remaining driving range."
+        f"Battery capacity: {inputs['battery_capacity_kwh']} kWh; "
+        "recommended charge target = 80%. Drivers may continue charging if needed. "
+        f"The car must retain at least {inputs['safety_reserve_pct']}% battery at every planned stop."
     )
     if route:
         st.write(f"**Driving distance:** {route['distance_miles']:.1f} miles · "
@@ -285,30 +331,28 @@ def show_results(frame, map_html, inputs, saved=False, diagnostics=None, route=N
             st.info("No optional chargers passed the route and battery filters. "
                     "You can reach the destination without stopping to charge.")
         else:
-            st.warning("No chargers meet the route, charging-window and 10% arrival filters. "
+            st.warning("No chargers meet the route, charging-window and selected arrival-reserve rules. "
                        "Adjust the trip inputs and calculate again.")
     else:
-        st.subheader(
-            "Optional Charging Stops" if diagnostics and not diagnostics.get("charging_needed")
-            else "Top 3 Recommended Charging Stops"
-        )
-        st.caption("These are alternative charging stops, not three stops to visit in sequence.")
+        heading = ("Optional Charging Stops" if diagnostics and not diagnostics.get("charging_needed")
+                   else f"Top {len(frame)} Recommended Next Charging Stop" + ("s" if len(frame) != 1 else ""))
+        st.subheader(heading)
+        st.caption("Choose one of these reachable next stops. For long trips, the app verifies that later compatible stops are reachable within the battery reserve. Live charger availability is not verified.")
         columns = {
-            "AddressTitle": "Station", "Town": "Town", "MaxPowerKW": "Power (kW)",
-            "FastChargeCount": "Recorded fast chargers",
+            "AddressTitle": "Station", "Town": "Town",
             "EstimatedBatteryAtArrivalPct": "Battery at charger (%)",
-            "RealisticChargeTimeMin": "Charge time (min)",
-            "DistanceToActualRouteMiles": "Distance from route (miles)",
-            "DistanceToDestinationMiles": "Distance to destination (miles)",
-            "EstimatedBatteryAtDestinationPct": "Battery at destination (%)",
-            "CanReachDestination": "Can reach destination",
-            "RecommendationScore": "Score",
+            "RealisticChargeTimeMin": "Time to 80% (min)",
+            "EstimatedChargingCost": "Cost to 80% ($)",
+            "NextLegStatus": "After this stop",
         }
         table = frame[list(columns)].copy()
-        table["CanReachDestination"] = table["CanReachDestination"].map(reach_label)
         table.index = range(1, len(table) + 1)
         table.index.name = "Rank"
         st.dataframe(table.rename(columns=columns).round(2), width="stretch")
+        st.caption(
+            f"Estimated cost uses ${inputs['electricity_price_per_kwh']:.2f}/kWh and excludes session, idle, parking, and tax fees. "
+            "Check the charging network's live price before starting the session."
+        )
     st.subheader("Route Map")
     st.iframe(map_html, height=740)
     st.caption("Click a colored marker to view its battery, charging time, amenities and score.")
@@ -319,6 +363,9 @@ def show_results(frame, map_html, inputs, saved=False, diagnostics=None, route=N
                 st.caption(str(row["AmenitySource"]))
             st.write(f"**Operator:** {row['Operator']}")
             st.write(f"**Connection types:** {row.get('ConnectionTypes', 'Unknown')}")
+            st.write(f"**Distance from route:** {row['DistanceToActualRouteMiles']:.2f} miles")
+            st.write(f"**Rated power:** {row['MaxPowerKW']:.0f} kW")
+            st.write(f"**Recommendation score:** {row['RecommendationScore']:.1f}")
     if diagnostics:
         for warning in diagnostics.get("warnings", []):
             st.warning(warning)
@@ -328,9 +375,7 @@ def show_results(frame, map_html, inputs, saved=False, diagnostics=None, route=N
     left.download_button("Download map", map_html, file_name="ev_route_map.html", mime="text/html")
     right.download_button("Download results", frame.to_csv(index=False).encode("utf-8-sig"),
                           file_name="charging_recommendations.csv", mime="text/csv")
-    if saved:
-        st.caption("Saved values retain the rounding in the original map popups. "
-                   "The map needs internet access to load its map tiles and JavaScript libraries.")
+
 
 
 def main():
@@ -350,7 +395,12 @@ def main():
         battery = st.slider("Current Battery (%)", 10, 100, 45)
         full_range = st.number_input("Estimated Full Range (miles)", 100, 500, 300)
         reserve = st.slider("Safety Reserve (%)", 5, 30, 20,
-                            help="Percentage of remaining range reserved, as in the notebook.")
+                            help="Minimum battery percentage retained on arrival at every planned stop.")
+        with st.expander("Cost assumptions"):
+            battery_capacity = st.number_input("Battery Capacity (kWh)", 30, 150, 75)
+            electricity_price = st.number_input("Estimated Price ($/kWh)", 0.00, 1.50, 0.45, 0.01,
+                                                help="Use a station/app price when available; this value is an estimate.")
+            st.caption("Recommendations use an 80% charge target. You may continue charging at the station if needed.")
         connector = st.selectbox("Connector Type", ["NACS", "CCS"])
         submitted = st.form_submit_button("Find Best Charging Stops")
     st.sidebar.caption("California charger data · Place search: © OpenStreetMap contributors")
@@ -360,7 +410,10 @@ def main():
         inputs = {"origin_name": origin_name.strip(),
                   "destination_name": destination_name.strip(),
                   "battery_percent": battery, "full_range_miles": full_range,
-                  "safety_reserve_pct": reserve, "vehicle_connector": connector}
+                  "safety_reserve_pct": reserve, "vehicle_connector": connector,
+                  "charge_target_pct": 80,
+                  "battery_capacity_kwh": battery_capacity,
+                  "electricity_price_per_kwh": electricity_price}
         progress = st.progress(0, text="Finding your trip locations…")
         try:
             origin_coords, resolved_origin = geocode_place(inputs["origin_name"])
@@ -374,11 +427,15 @@ def main():
                 safety_reserve_pct=reserve, vehicle_connector=connector,
                 route_points=route["route_points"],
                 route_lookup=fetch_route, amenity_lookup=fetch_amenities,
+                route_lookup_many=fetch_routes_many,
                 progress=lambda fraction, message: progress.progress(
                     min(1.0, max(0.0, fraction)), text=message),
                 origin_coords=origin_coords,
                 destination_coords=destination_coords,
                 route_distance_miles=route["distance_miles"],
+                charge_target_pct=80,
+                battery_capacity_kwh=battery_capacity,
+                electricity_price_per_kwh=electricity_price,
             )
             map_html = build_map(
                 frame, route["route_points"], origin_coords, destination_coords,
@@ -398,14 +455,8 @@ def main():
         show_results(frame, map_html, inputs, diagnostics=diagnostics,
                      route=route, resolved_locations=locations)
     elif not st.session_state.get("attempted_search"):
-        st.caption("Example from the saved notebook · San Jose → Lake Tahoe · "
-                   "45% battery · 300-mile range · 20% reserve · NACS")
-        try:
-            frame, map_html = load_saved_results()
-        except (OSError, ValueError, KeyError, AttributeError) as exc:
-            st.error(f"Cannot read the saved notebook map: {exc}")
-            return
-        show_results(frame, map_html, DEFAULT_INPUTS, saved=True)
+        st.info("Enter your trip details and select Find Best Charging Stops to calculate reachable charging options.")
+
 
 
 if __name__ == "__main__":
